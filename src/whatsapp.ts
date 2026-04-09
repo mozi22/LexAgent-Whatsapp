@@ -23,8 +23,8 @@ import { handleMessage } from "./lexoffice/index";
  * Format: country-code digits (no "+") + "@s.whatsapp.net"
  */
 const ALLOWED_JIDS = new Set<string>([
-  '4917630135775@s.whatsapp.net',
-  '491605566060@s.whatsapp.net',
+  "4917630135775@s.whatsapp.net",
+  "491605566060@s.whatsapp.net",
 ]);
 
 // ── Per-user active state ─────────────────────────────────────────────────────
@@ -39,6 +39,11 @@ const lexActive = new Map<string, boolean>();
 function isLexActive(jid: string): boolean {
   return lexActive.get(jid) !== false;
 }
+
+// ── Per-user last command (for "try again") ───────────────────────────────────
+
+/** Stores the last non-control command per JID so it can be retried. */
+const lastCommand = new Map<string, string>();
 
 // ── Session registry ──────────────────────────────────────────────────────────
 
@@ -67,8 +72,8 @@ export async function startWhatsAppSetup(
   // ── Authorisation check (shown on the setup page, not in WhatsApp) ────────
   if (!ALLOWED_JIDS.has(jid)) {
     send(ws, {
-      type: 'error',
-      message: '⛔ You are not authorized to use this system.',
+      type: "error",
+      message: "⛔ You are not authorized to use this system.",
     });
     return;
   }
@@ -156,7 +161,11 @@ export async function startWhatsAppSetup(
         console.log("[reconnect] scheduling for:", phoneNumber);
 
         // End the current socket cleanly before creating a new one.
-        try { sock.end(undefined); } catch { /* already closed */ }
+        try {
+          sock.end(undefined);
+        } catch {
+          /* already closed */
+        }
 
         await new Promise<void>((resolve) => setTimeout(resolve, 3000));
         await startWhatsAppSetup(ws, phoneNumber);
@@ -185,7 +194,14 @@ export async function startWhatsAppSetup(
           });
         }
 
-        setupMessageHandler(ws, sock, jid);
+        // Read own LID (linked-device ID) so we can accept self-chat messages
+        // arriving with a @lid remoteJid (e.g. from a secondary device) while
+        // still rejecting messages sent TO other contacts from those devices.
+        const rawLid = sock.authState.creds.me?.lid;
+        const ownLid = rawLid ? jidNormalizedUser(rawLid) : null;
+        console.log("[setup] own JID:", jid, "| own LID:", ownLid);
+
+        setupMessageHandler(ws, sock, jid, ownLid);
       }
     });
 
@@ -215,6 +231,7 @@ function setupMessageHandler(
   ws: WebSocket,
   sock: ReturnType<typeof makeWASocket>,
   jid: string,
+  ownLid: string | null,
 ): void {
   // Track IDs of messages the bot sent so we never reply to ourselves.
   const botSentIds = new Set<string>();
@@ -227,7 +244,12 @@ function setupMessageHandler(
 
     const msg = messages[0];
     if (!msg || !msg.message) {
-      console.log("[skip] null message — likely a decryption failure (stale session). Run: rm -rf sessions/ and re-scan QR.");
+      // null message = Bad MAC / decryption failure. Baileys logs "Closing open
+      // session in favor of incoming prekey bundle" and self-heals automatically.
+      // No action needed — the next message will decrypt correctly.
+      console.log(
+        "[skip] null message — Bad MAC decryption failure, Baileys is self-healing. Next message will work.",
+      );
       return;
     }
 
@@ -242,27 +264,22 @@ function setupMessageHandler(
       Object.keys(msg.message)[0],
     );
 
-    // ── GUARDRAIL ─────────────────────────────────────────────────────────────
+    // ── STRICT SELF-CHAT GUARDRAIL ────────────────────────────────────────────
+    // Only process messages in the owner's self-chat window.
+    // Two valid forms:
+    //   1. remoteJid normalises to the owner's own @s.whatsapp.net JID
+    //   2. fromMe=true with a @lid address (linked device / secondary device)
+    // Everything else — other contacts, groups, broadcasts — is dropped.
     if (!from) return;
-
-    // Groups, broadcasts, channels — drop silently.
-    if (from.endsWith('@g.us') || from.endsWith('@broadcast') || from.endsWith('@newsletter')) {
-      console.log("[skip] group/broadcast/channel — jid:", from);
-      return;
-    }
-
-    // Messages with fromMe:true come from the account owner's own devices
-    // (phone, linked devices, LID addresses). They are inherently authorised.
-    // Messages from other contacts must be in the whitelist.
     const normalizedFrom = jidNormalizedUser(from);
-    const isOwner = msg.key.fromMe === true;
-    const isWhitelisted = ALLOWED_JIDS.has(normalizedFrom);
+    const isSelfChat =
+      normalizedFrom === jid ||
+      (ownLid !== null && normalizedFrom === ownLid);
 
-    if (!isOwner && !isWhitelisted) {
-      console.log("[skip] not authorised — jid:", normalizedFrom);
+    if (!isSelfChat) {
+      console.log("[skip] not self-chat — from:", normalizedFrom, "expected:", jid, "lid:", ownLid);
       return;
     }
-
 
     const msgId = msg.key.id;
 
@@ -293,6 +310,8 @@ function setupMessageHandler(
 
     // Sends an intermediate progress update and registers its ID so the
     // bot-loop guard does not re-process it.
+    // Silently swallows "Connection Closed" errors — the socket may have
+    // dropped between the message arriving and the send completing.
     const sendProgress: SendProgress = async (progressText) => {
       try {
         const sent = await sock.sendMessage(replyTo, { text: progressText });
@@ -341,20 +360,37 @@ async function processMessage(
   // ── Lex on/off switch — always checked, even when sleeping ───────────────
   if (/^lex\s+up\b/i.test(lower)) {
     lexActive.set(from, true);
-    console.log('[lex] active for:', from);
-    return '✅ Your Lex Agent is now Active.';
+    console.log("[lex] active for:", from);
+    return "✅ Your Lex Agent is now Active.";
   }
   if (/^lex\s+(down|sleep)\b/i.test(lower)) {
     lexActive.set(from, false);
-    console.log('[lex] sleeping for:', from);
-    return '💤 Your Lex Agent is now asleep.';
+    console.log("[lex] sleeping for:", from);
+    return "💤 Your Lex Agent is now asleep.";
   }
 
   // ── Drop all other messages while sleeping ────────────────────────────────
   if (!isLexActive(from)) {
-    console.log('[lex] agent sleeping — dropping message from:', from);
+    console.log("[lex] agent sleeping — dropping message from:", from);
     return null;
   }
+
+  // ── Try again — replay last command ──────────────────────────────────────
+  if (/^try\s+again\b/i.test(lower)) {
+    const last = lastCommand.get(from);
+    if (!last) return "⚠️ No previous command to retry.";
+    console.log("[try again] replaying:", JSON.stringify(last));
+    text = last;
+  } else {
+    // Store this as the last command (excluding control commands above).
+    lastCommand.set(from, text);
+  }
+
+  // ── Acknowledgement — only reaches here for real queries ─────────────────
+  sendProgress("⏳ Processing...");
+
+  // Recompute lower in case text was replaced by "try again".
+  const effectiveLower = text.toLowerCase().trim();
 
   // ── Active: route to Lexoffice module, then keyword fallbacks ────────────
   const lexReply = await handleMessage(text, from, sendProgress);
@@ -362,10 +398,10 @@ async function processMessage(
 
   // ── Keyword fallbacks ─────────────────────────────────────────────────────
 
-  if (/^(hi|hello|hey|howdy|hola)\b/.test(lower)) {
+  if (/^(hi|hello|hey|howdy|hola)\b/.test(effectiveLower)) {
     return "👋 Hello! I'm your WhatsApp agent connected to Lexoffice.\n\nType *help* to see what I can do.";
   }
-  if (/\bhelp\b/.test(lower)) {
+  if (/\bhelp\b/.test(effectiveLower)) {
     return (
       "📋 *What I can do:*\n\n" +
       "*Contacts*\n" +
@@ -379,13 +415,13 @@ async function processMessage(
       "Type *cancel* at any time to stop a multi-step operation."
     );
   }
-  if (/\b(about|who are you|what are you)\b/.test(lower)) {
+  if (/\b(about|who are you|what are you)\b/.test(effectiveLower)) {
     return "🤖 I'm an automated WhatsApp agent connected to Lexoffice. Ask me about contacts or invoices in natural language.";
   }
-  if (/\b(bye|goodbye|see you|cya)\b/.test(lower)) {
+  if (/\b(bye|goodbye|see you|cya)\b/.test(effectiveLower)) {
     return "👋 Goodbye! Feel free to message again anytime.";
   }
-  if (/\bthank(s| you)\b/.test(lower)) {
+  if (/\bthank(s| you)\b/.test(effectiveLower)) {
     return "😊 You're welcome! Is there anything else I can help with?";
   }
 
